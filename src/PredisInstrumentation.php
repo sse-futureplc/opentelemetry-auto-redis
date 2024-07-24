@@ -16,6 +16,7 @@ use OpenTelemetry\API\Trace\SpanBuilderInterface;
 use OpenTelemetry\API\Trace\SpanKind;
 use OpenTelemetry\API\Trace\StatusCode;
 use OpenTelemetry\Context\Context;
+use Predis\Pipeline\Pipeline;
 use function OpenTelemetry\Instrumentation\hook;
 use OpenTelemetry\SemConv\TraceAttributes;
 use Predis\Command\CommandInterface;
@@ -35,11 +36,11 @@ class PredisInstrumentation
             '__construct',
             pre: static function (
                 \Predis\Client $redis,
-                array $params,
-                string $class,
-                string $function,
-                ?string $filename,
-                ?int $lineno,
+                array          $params,
+                string         $class,
+                string         $function,
+                ?string        $filename,
+                ?int           $lineno,
             ) use ($instrumentation) {
                 /** @psalm-suppress ArgumentTypeCoercion */
                 $builder = self::makeBuilder(
@@ -49,23 +50,10 @@ class PredisInstrumentation
                     $class,
                     $filename,
                     $lineno,
-                )
-                    ->setSpanKind(SpanKind::KIND_CLIENT);
+                )->setSpanKind(SpanKind::KIND_CLIENT);
+
                 $host = $params[0];
-                if (array_is_list($host)) {
-                    $host = $host[0];
-                }
-                if ($class === \Predis\Client::class) {
-                    $builder->setAttribute(TraceAttributes::SERVER_ADDRESS, $host['host'] ?? $host['path'] ?? 'unknown')
-                        ->setAttribute(TraceAttributes::NETWORK_TRANSPORT, $host['scheme'] ?? 'unknown');
-                    if (array_key_exists('port', $host)) {
-                        $builder->setAttribute(TraceAttributes::SERVER_PORT, $host['port'] ?? 'unknown');
-                    }
-                    $auth = $host['parameters']['username'] ?? $params[1]['parameters']['username'] ?? null;
-                    if (!empty($auth)) {
-                        $builder->setAttribute(TraceAttributes::DB_USER, $auth[0]);
-                    }
-                }
+
                 $parent = Context::getCurrent();
                 $span = $builder->startSpan();
                 Context::storage()->attach($span->storeInContext($parent));
@@ -90,11 +78,11 @@ class PredisInstrumentation
             'executeCommand',
             pre: static function (
                 \Predis\Client $redis,
-                array $params,
-                string $class,
-                string $function,
-                ?string $filename,
-                ?int $lineno,
+                array          $params,
+                string         $class,
+                string         $function,
+                ?string        $filename,
+                ?int           $lineno,
             ) use ($attributeTracker, $instrumentation) {
                 /** @psalm-suppress ArgumentTypeCoercion */
                 $builder = self::makeBuilder(
@@ -159,16 +147,115 @@ class PredisInstrumentation
                 self::end($exception);
             },
         );
+        hook(
+            Pipeline::class,
+            'executePipeline',
+            pre: static function (
+                Pipeline $pipeline,
+                array    $params,
+                string   $class,
+                string   $function,
+                ?string  $filename,
+                ?int     $lineno,
+            ) use ($attributeTracker, $instrumentation) {
+                $builder = self::makeBuilder(
+                    $instrumentation,
+                    'Predis::executePipeline',
+                    $function,
+                    $class,
+                    $filename,
+                    $lineno,
+                )->setSpanKind(SpanKind::KIND_CLIENT);
+
+                $parent = Context::getCurrent();
+                $rootSpan = $builder->startSpan();
+
+                Context::storage()->attach($rootSpan->storeInContext($parent));
+
+                if (is_a($class, Pipeline::class, true)) {
+                    if (isset($params[1]) && $params[1] instanceof \SplQueue) {
+                        /**
+                         * @var \SplQueue<CommandInterface> $commands
+                         */
+                        $commands = clone $params[1];
+
+                        foreach ($commands as $command) {
+                            $commandBuilder = self::makeBuilder(
+                                $instrumentation,
+                                "Predis::{$command->getId()}",
+                                $function,
+                                $class,
+                                $filename,
+                                $lineno
+                            )->setSpanKind(SpanKind::KIND_CLIENT);
+
+                            $statement = $command->getId();
+                            $maskArgs = false;
+                            foreach ($command->getArguments() as $arg) {
+                                if ($maskArgs) {
+                                    if (is_array($arg)) {
+                                        foreach ($arg as $subArg) {
+                                            $statement .= ' ?';
+                                        }
+
+                                        continue;
+                                    }
+                                    $statement .= ' ?';
+
+                                    continue;
+                                }
+                                $maskArgs = true;
+                                if (is_array($arg) && array_is_list($arg)) {
+                                    foreach ($arg as $subArg) {
+                                        $statement .= ' ' . $subArg;
+                                    }
+
+                                    continue;
+                                }
+                                $statement .= ' ' . $arg;
+                            }
+                            $commandBuilder->setAttribute(
+                                TraceAttributes::DB_STATEMENT,
+                                $statement,
+                            );
+
+                            $parent = Context::getCurrent();
+                            $span = $commandBuilder->startSpan();
+
+                            $attributes = $attributeTracker->trackedAttributesForRedis($pipeline->getClient());
+                            $span->setAttributes($attributes);
+
+                            $span->end();
+                        }
+                    }
+                }
+            },
+            post: static function (Pipeline $pipeline, array $params, mixed $returnStatement, ?Throwable $exception) {
+                $scope = Context::storage()->scope();
+                if (!$scope) {
+                    return;
+                }
+                $scope->detach();
+                $span = Span::fromContext($scope->context());
+                if ($exception) {
+                    $span->recordException($exception, [TraceAttributes::EXCEPTION_ESCAPED => true]);
+                    $span->setStatus(StatusCode::STATUS_ERROR, $exception->getMessage());
+                }
+
+                $span->end();
+            },
+        );
     }
 
     private static function makeBuilder(
         CachedInstrumentation $instrumentation,
-        string $name,
-        string $function,
-        string $class,
-        ?string $filename,
-        ?int $lineno,
-    ): SpanBuilderInterface {
+        string                $name,
+        string                $function,
+        string                $class,
+        ?string               $filename,
+        ?int                  $lineno,
+    ): SpanBuilderInterface
+    {
         /** @psalm-suppress ArgumentTypeCoercion */
         return $instrumentation->tracer()
             ->spanBuilder($name)
